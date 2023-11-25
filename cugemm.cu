@@ -9,6 +9,7 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <mma.h>
 
 // from https://github.com/jarro2783/cxxopts
 #include "cxxopts.hpp"
@@ -31,10 +32,10 @@ const char *algo2str(Algo a)
     {
     case cublas_hgemm:
         return "cublas_hgemm";
-    case cuda_hgemm:
+    /*case cuda_hgemm:
         return "cuda_hgemm";
     case tensor_hgemm:
-        return "tensor_hgemm";
+        return "tensor_hgemm";*/
     default:
         return "INVALID";
     }
@@ -95,7 +96,8 @@ int main(int argc, char **argv)
 
     // Setup cublas
     cublasHandle_t handle;
-    cublasCheck(cublasCreate(&handle));
+    cublasCreate(&handle);
+    cublasSetMathMode(handle,CUBLAS_TENSOR_OP_MATH);
 
     // Using cudaEvent for gpu stream timing, cudaEvent is equivalent to
     // publishing event tasks in the target stream
@@ -301,15 +303,16 @@ bool verify_matrix(half *expected, half *actual, int M, int N)
     return true;
 }
 
-void runCublas(cublasHandle_t handle, int M, int N, int K, float alpha,
-               float *A, float *B, float beta, float *C)
+void runCublas(cublasHandle_t handle, int M, int N, int K, half alpha,
+               half *A, half *B, half beta, half *C)
 {
 
-    cublasStatus_t ok = cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, B, N, A, K, &beta, C, N);
+    cublasStatus_t ok = cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha, B, CUDA_R_16F, K, A, CUDA_R_16F, K,
+                                    &beta, C, CUDA_R_16F, N, CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     cublasCheck(ok);
 }
 
-__global__ void runBasic(int M, int N, int K, float alpha, float *A, float *B, float beta, float *C)
+/*__global__ void runBasic(int M, int N, int K, float alpha, float *A, float *B, float beta, float *C)
 {
     const unsigned x = blockIdx.x * blockDim.x + threadIdx.x;
     const unsigned y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -529,42 +532,24 @@ __global__ void runSharedMemMultiOutput(int M, int N, int K, float alpha, float 
         }
         
 }
+*/
 
-void runAlgo(Algo algo, cublasHandle_t handle, int M, int N, int K, float alpha,
-             float *A, float *B, float beta, float *C)
+void runAlgo(Algo algo, cublasHandle_t handle, int M, int N, int K, half alpha,
+             half *A, half *B, half beta, half *C)
 {
     switch (algo)
     {
-    case cublas:
+    case cublas_hgemm:
         runCublas(handle, M, N, K, alpha, A, B, beta, C);
         break;
-    case basic:
+    /*case cuda_hgemm:
     {
         dim3 gridDim(ROUND_UP_TO_NEAREST(M, 32), ROUND_UP_TO_NEAREST(N, 32));
         dim3 blockDim(32, 32);
         runBasic<<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
         break;
     }
-    case gmem_coalesced:
-    {
-        dim3 gridDim(ROUND_UP_TO_NEAREST(M, 32), ROUND_UP_TO_NEAREST(N, 32));
-        dim3 blockDim(32*32); // Changing the block dimensions to 1
-        runGmemCoalesced<<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
-        break;
-    }
-    case smem:
-    {
-        assert(0 == M % F);
-        assert(0 == N % F);
-        assert(0 == K % F);
-        // TODO: update your grid here
-        dim3 gridDim(ROUND_UP_TO_NEAREST(M, F)-1/F+1, ROUND_UP_TO_NEAREST(N, F)-1/F+1);
-        //dim3 gridDim(ROUND_UP_TO_NEAREST(M, 32)/F, ROUND_UP_TO_NEAREST(N, 32)/F);
-        dim3 blockDim(F, F);
-        runSharedMem<<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
-        break;
-    }
-    case smem_multioutput:
+    case tensor_hgemm:
     {
         assert(0 == M % F);
         assert(0 == N % F);
@@ -577,7 +562,7 @@ void runAlgo(Algo algo, cublasHandle_t handle, int M, int N, int K, float alpha,
         dim3 blockDim((F*F)/(G*G));
         runSharedMemMultiOutput<<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
         break;
-    }
+    }*/
     default:
         printf("Invalid algorithm: %d\n", algo);
         exit(EXIT_FAILURE);
