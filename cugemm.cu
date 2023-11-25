@@ -19,11 +19,9 @@
 
 enum Algo
 {
-    cublas = 0,
-    basic,
-    gmem_coalesced,
-    smem,
-    smem_multioutput,
+    cublas_hgemm = 0,
+    cuda_hgemm,
+    tensor_hgemm,
     numAlgos
 };
 
@@ -31,16 +29,12 @@ const char *algo2str(Algo a)
 {
     switch (a)
     {
-    case cublas:
-        return "cublas";
-    case basic:
-        return "basic";
-    case gmem_coalesced:
-        return "gmem_coalesced";
-    case smem:
-        return "sharedmem";
-    case smem_multioutput:
-        return "sharedmem_multioutput";
+    case cublas_hgemm:
+        return "cublas_hgemm";
+    case cuda_hgemm:
+        return "cuda_hgemm";
+    case tensor_hgemm:
+        return "tensor_hgemm";
     default:
         return "INVALID";
     }
@@ -48,12 +42,12 @@ const char *algo2str(Algo a)
 
 void cudaErrorCheck(cudaError_t error, const char *file, int line);
 void cublasErrorCheck(cublasStatus_t status, const char *file, int line);
-void randomize_matrix(float *mat, int N);
-void const_init_matrix(float *mat, int N, float F);
-bool verify_matrix(float *expected, float *actual, int M, int N);
-void print_matrix(const float *A, int M, int N, std::ostream &outs);
-void runAlgo(Algo algo, cublasHandle_t handle, int M, int N, int K, float alpha, float *A, float *B, float beta, float *C);
-void runCublas(cublasHandle_t handle, int M, int N, int K, float alpha, float *A, float *B, float beta, float *C);
+void randomize_matrix(half *mat, int N);
+void const_init_matrix(half *mat, int N, half F);
+bool verify_matrix(half *expected, half *actual, int M, int N);
+void print_matrix(const half *A, int M, int N, std::ostream &outs);
+void runAlgo(Algo algo, cublasHandle_t handle, int M, int N, int K, half alpha, half *A, half *B, half beta, half *C);
+void runCublas(cublasHandle_t handle, int M, int N, int K, half alpha, half *A, half *B, half beta, half *C);
 
 const std::string errLogFile = "gemmValidationFailure.txt";
 
@@ -67,7 +61,7 @@ int main(int argc, char **argv)
     cxxopts::Options options("gemm.cu", "CUDA GEMM kernels");
     options.add_options()("size", "matrix size (N x N)", cxxopts::value<uint16_t>()->default_value("128"))                //
         ("reps", "repeat GEMM this many times", cxxopts::value<uint16_t>()->default_value("1"))                           //
-        ("algo", "GEMM algorithm to use, a number in [0,4], 0 is cuBLAS", cxxopts::value<uint16_t>()->default_value("0")) //
+        ("algo", "GEMM algorithm to use, a number in [0,2], 0 is cuBLAS", cxxopts::value<uint16_t>()->default_value("0")) //
         ("validate", "Validate output against cuBLAS", cxxopts::value<bool>()->default_value("true"))                     //
         ("rngseed", "PRNG seed", cxxopts::value<uint>()->default_value("2"))                     //
         ("h,help", "Print usage");
@@ -114,36 +108,34 @@ int main(int argc, char **argv)
     // GEMM computes C = α*AB+β*C
 
     // just do pure A*B (for simpler debugging)
-    float alpha = 1.0, beta = 1.0, initC = 1.0;
+    half alpha = 1.0, beta = 1.0, initC = 1.0;
 
-    float *A = nullptr, *B = nullptr, *C = nullptr, *C_ref = nullptr;     // host matrices
-    float *dA = nullptr, *dB = nullptr, *dC = nullptr, *dC_ref = nullptr; // device matrices
+    half *A = nullptr, *B = nullptr, *C = nullptr, *C_ref = nullptr;     // host matrices
+    half *dA = nullptr, *dB = nullptr, *dC = nullptr, *dC_ref = nullptr; // device matrices
 
-    A = (float *)malloc(sizeof(float) * SIZE * SIZE);
-    B = (float *)malloc(sizeof(float) * SIZE * SIZE);
-    C = (float *)malloc(sizeof(float) * SIZE * SIZE);
-    C_ref = (float *)malloc(sizeof(float) * SIZE * SIZE);
+    A = (half *)malloc(sizeof(half) * SIZE * SIZE);
+    B = (half *)malloc(sizeof(half) * SIZE * SIZE);
+    C = (half *)malloc(sizeof(half) * SIZE * SIZE);
+    C_ref = (half *)malloc(sizeof(half) * SIZE * SIZE);
 
     randomize_matrix(A, SIZE * SIZE);
     randomize_matrix(B, SIZE * SIZE);
     randomize_matrix(C, SIZE * SIZE);
 
     const_init_matrix(C, SIZE * SIZE, initC);
-    // print_matrix(A, SIZE, SIZE, std::cout);
-    // print_matrix(B, SIZE, SIZE, std::cout);
-    // print_matrix(C, SIZE, SIZE, std::cout);
 
-    cudaCheck(cudaMalloc((void **)&dA, sizeof(float) * SIZE * SIZE));
-    cudaCheck(cudaMalloc((void **)&dB, sizeof(float) * SIZE * SIZE));
-    cudaCheck(cudaMalloc((void **)&dC, sizeof(float) * SIZE * SIZE));
-    cudaCheck(cudaMalloc((void **)&dC_ref, sizeof(float) * SIZE * SIZE));
 
-    cudaCheck(cudaMemcpy(dA, A, sizeof(float) * SIZE * SIZE, cudaMemcpyHostToDevice));
-    cudaCheck(cudaMemcpy(dB, B, sizeof(float) * SIZE * SIZE, cudaMemcpyHostToDevice));
-    cudaCheck(cudaMemcpy(dC, C, sizeof(float) * SIZE * SIZE, cudaMemcpyHostToDevice));
-    cudaCheck(cudaMemcpy(dC_ref, C, sizeof(float) * SIZE * SIZE, cudaMemcpyHostToDevice));
+    cudaCheck(cudaMalloc((void **)&dA, sizeof(half) * SIZE * SIZE));
+    cudaCheck(cudaMalloc((void **)&dB, sizeof(half) * SIZE * SIZE));
+    cudaCheck(cudaMalloc((void **)&dC, sizeof(half) * SIZE * SIZE));
+    cudaCheck(cudaMalloc((void **)&dC_ref, sizeof(half) * SIZE * SIZE));
 
-    printf("dimensions(m=n=k) %u, alpha: %f, beta: %f\n", m, alpha, beta);
+    cudaCheck(cudaMemcpy(dA, A, sizeof(half) * SIZE * SIZE, cudaMemcpyHostToDevice));
+    cudaCheck(cudaMemcpy(dB, B, sizeof(half) * SIZE * SIZE, cudaMemcpyHostToDevice));
+    cudaCheck(cudaMemcpy(dC, C, sizeof(half) * SIZE * SIZE, cudaMemcpyHostToDevice));
+    cudaCheck(cudaMemcpy(dC_ref, C, sizeof(half) * SIZE * SIZE, cudaMemcpyHostToDevice));
+
+    printf("dimensions(m=n=k) %u, alpha: %f, beta: %f\n", m, __half2float(alpha), __half2float(beta));
 
     // Verify the correctness of the calculation, and execute it once before the
     // kernel function timing to avoid cold start errors
@@ -162,8 +154,8 @@ int main(int argc, char **argv)
         cudaCheck(cudaDeviceSynchronize());
 
         // copy both results back to host
-        cudaMemcpy(C, dC, sizeof(float) * m * n, cudaMemcpyDeviceToHost);
-        cudaMemcpy(C_ref, dC_ref, sizeof(float) * m * n, cudaMemcpyDeviceToHost);
+        cudaMemcpy(C, dC, sizeof(half) * m * n, cudaMemcpyDeviceToHost);
+        cudaMemcpy(C_ref, dC_ref, sizeof(half) * m * n, cudaMemcpyDeviceToHost);
 
         if (verify_matrix(C_ref, C, n, m))
         {
@@ -175,8 +167,8 @@ int main(int argc, char **argv)
             std::cout << " Logging faulty output into " << errLogFile << "\n";
             std::ofstream fs;
             fs.open(errLogFile, std::ios::out | std::ios::trunc);
-            fs << "α=" << alpha << " β=" << beta << std::endl;
-            fs << "C matrix initialized to " << initC << std::endl << std::endl;
+            fs << "α=" << __half2float(alpha) << " β=" << __half2float(beta) << std::endl;
+            fs << "C matrix initialized to " << __half2float(initC) << std::endl << std::endl;
             fs << "A:" << std::endl;
             print_matrix(A, m, n, fs);
             fs << "B:" << std::endl;
@@ -250,7 +242,7 @@ void cublasErrorCheck(cublasStatus_t status, const char *file, int line)
 }
 
 /** Initialize the given matrix `mat` which has `N` contiguous values. Contents of `mat` are set to random values. */
-void randomize_matrix(float *mat, int N)
+void randomize_matrix(half *mat, int N)
 {
     for (int i = 0; i < N; i++)
     {
@@ -258,7 +250,7 @@ void randomize_matrix(float *mat, int N)
     }
 }
 
-void const_init_matrix(float *mat, int N, float F)
+void const_init_matrix(half *mat, int N, half F)
 {
     for (int i = 0; i < N; i++)
     {
@@ -267,18 +259,18 @@ void const_init_matrix(float *mat, int N, float F)
 }
 
 /** Print the given MxN matrix `mat` to the provided output stream. */
-void print_matrix(const float *A, int M, int N, std::ostream &outs)
+void print_matrix(const half *A, int M, int N, std::ostream &outs)
 {
     outs << "[";
     for (int i = 0; i < M * N; i++)
     {
         if ((i + 1) % N == 0)
         {
-            outs << std::fixed << std::setprecision(3) << A[i];
+            outs << std::fixed << std::setprecision(3) << __half2float(A[i]);
         }
         else
         {
-            outs << std::fixed << std::setprecision(3) << A[i] << ", ";
+            outs << std::fixed << std::setprecision(3) << __half2float(A[i]) << ", ";
         }
         if ((i + 1) % N == 0)
         {
@@ -289,19 +281,19 @@ void print_matrix(const float *A, int M, int N, std::ostream &outs)
     outs << "]" << std::endl << std::endl;
 }
 
-bool verify_matrix(float *expected, float *actual, int M, int N)
+bool verify_matrix(half *expected, half *actual, int M, int N)
 {
     for (int i = 0; i < N; i++)
     {
         for (int j = 0; j < M; j++)
         {
-            float fexp = (expected[(i * N) + j]);
-            float fact = (actual[(i * N) + j]);
-            double diff = std::fabs(fexp - fact);
+            half fexp = (expected[(i * N) + j]);
+            half fact = (actual[(i * N) + j]);
+            double diff = std::fabs(__half2float(fexp) - __half2float(fact));
             if (diff > 0.002)
             {
                 printf("Divergence! Should be %5.3f, is %5.3f (diff %5.3f) at [%d,%d]\n",
-                       fexp, fact, diff, i, j);
+                       __half2float(fexp), __half2float(fact), __half2float(diff), i, j);
                 return false;
             }
         }
@@ -312,11 +304,7 @@ bool verify_matrix(float *expected, float *actual, int M, int N)
 void runCublas(cublasHandle_t handle, int M, int N, int K, float alpha,
                float *A, float *B, float beta, float *C)
 {
-    // cuBLAS uses *column-major* order. So we change the order of our row-major A &
-    // B, since (B^T*A^T)^T = (A*B)
-    // cublasStatus_t ok = cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, B, CUDA_R_16F,
-    //                                  N, A, CUDA_R_16F, K, &beta, C, CUDA_R_16F, N, /*CUBLAS_COMPUTE_16F*/ CUBLAS_COMPUTE_16F_PEDANTIC,
-    //                                  CUBLAS_GEMM_DEFAULT);
+
     cublasStatus_t ok = cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, B, N, A, K, &beta, C, N);
     cublasCheck(ok);
 }
