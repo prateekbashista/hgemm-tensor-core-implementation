@@ -476,24 +476,15 @@ __global__ void runSharedMemMultiOutput(int M, int N, int K, half alpha, half *A
     C += blockIdx.y * F * N + blockIdx.x * F;
     
 
-    // if (row < M && column < N)
-    // {
-    //printf("\n row = %d", row_l);
-    //float tmp = 0.0;
-    // C = α*(AxB)+β*C
+
         for (int i = 0; i < K/F; ++i)
         {
             // tmp += __A__[x][i] * __B__[i][y]
             for(int c = 0; c < F; c+=stride)
             {
                 SA[row_s + c][column_s] = A[((row_s + c) * K) + i*F+column_s];
-                //printf("A element at address %d = %f \n",((row_s + c) * K) + i*F+column_s, A[((row_s + c) * K) + i*F+column_s]);
-                //printf("A Accessed into SA (address: %d,%d): %f  , blockid = %d \n",row_s + c,column_s,SA[row_s + c][column_s],blockIdx.x);
-                //printf("\n SA :  address : %d,%d element : %f  row = %d column = %d A:  address: %d, element : %f",row_s + c,column_s, SA[row_s + c][column_s],row_s,column_s,c, ((row_s + c) * K) + i*F+column_s,A[((row_s + c) * K) + i*F+column_s]);
                 SB[row_s + c][column_s] = B[(i* F + (row_s + c))*K + column_s];
-                //printf("B element at address %d = %f \n",(i* F + (row_s + c))*K + column_s, B[(i* F + (row_s + c))*K + column_s]);
-                //printf("A Accessed into SA (address: %d,%d): %f , row  = %d , blockid = %d \n",row_s + c,column_s,SA[row_s + c][column_s],row,blockIdx.x);
-
+                
             }
             __syncthreads();    
 
