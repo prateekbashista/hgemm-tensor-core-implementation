@@ -376,7 +376,7 @@ __global__ void runGmemCoalesced(int M, int N, int K, float alpha, float *A, flo
     }
 }
 
-const uint F = 32;
+
 
 __global__ void runSharedMem(int M, int N, int K, float alpha, float *A, float *B, float beta, float *C)
 {
@@ -436,10 +436,11 @@ __global__ void runSharedMem(int M, int N, int K, float alpha, float *A, float *
     }
     }
 
-
+*/
 const uint G = 4;
+const uint F = 32;
 
-__global__ void runSharedMemMultiOutput(int M, int N, int K, float alpha, float *A, float *B, float beta, float *C)
+__global__ void runSharedMemMultiOutput(int M, int N, int K, half alpha, half *A, half *B, half beta, half *C)
 {
     // HW3 TODO: Copy your runSharedMem() code here and update it so that each thread computes the result for GxG cells 
     // of the output matrix C. Each thread should accumulate temporary results in the local LC matrix, provided below,
@@ -448,12 +449,12 @@ __global__ void runSharedMemMultiOutput(int M, int N, int K, float alpha, float 
     // Note, you will also need to change the grid dimensions in the kernel launch below. You should experiment 
     // with different values of F and G to see how they affect performance.
 
-    __shared__ float SA[F][F];
-    __shared__ float SB[F][F];
+    __shared__ half SA[F][F];
+    __shared__ half SB[F][F];
 
-    float LC[G][G] = {0.0};
-    float resSA[G] = {0.0}; // Temp 
-    float resSB[G] = {0.0}; // Temp
+    half LC[G][G] = {0.0};
+    half resSA[G] = {0.0}; // Temp 
+    half resSB[G] = {0.0}; // Temp
 
     //const unsigned threadx = threadIdx.x;
     //const unsigned thready = threadIdx.y;
@@ -510,7 +511,8 @@ __global__ void runSharedMemMultiOutput(int M, int N, int K, float alpha, float 
                 {
                     for(int n = 0 ; n < G ; ++n)
                     {
-                        LC[m][n] += resSA[m] * resSB[n];
+                        LC[m][n] = LC[m][n] +  resSA[m] * resSB[n];
+
                         //printf("\n LC  = %f \n", LC[m][n]);
                     }
                     
@@ -526,13 +528,13 @@ __global__ void runSharedMemMultiOutput(int M, int N, int K, float alpha, float 
         {
             for(int n = 0 ; n < G ; ++n)
             {
-                C[(row_l * G + m)*M + column_l * G + n] = (alpha * LC[m][n]) + (beta * C[(row_l * G + m)*M + column_l * G + n]);
+                C[(row_l * G + m)*M + column_l * G + n] = (alpha * __float2half(LC[m][n])) + (beta * C[(row_l * G + m)*M + column_l * G + n]);
                 //printf("\n C at %d,%d  = %f , row  = %d, column = %d \n", (row_l * G + m)*M , column_l * G + n ,C[(row_l * G + m)*M + column_l * G + n], row_l, column_l);
             }
         }
         
 }
-*/
+
 
 void runAlgo(Algo algo, cublasHandle_t handle, int M, int N, int K, half alpha,
              half *A, half *B, half beta, half *C)
@@ -542,13 +544,21 @@ void runAlgo(Algo algo, cublasHandle_t handle, int M, int N, int K, half alpha,
     case cublas_hgemm:
         runCublas(handle, M, N, K, alpha, A, B, beta, C);
         break;
-    /*case cuda_hgemm:
+    case cuda_hgemm:
     {
-        dim3 gridDim(ROUND_UP_TO_NEAREST(M, 32), ROUND_UP_TO_NEAREST(N, 32));
-        dim3 blockDim(32, 32);
-        runBasic<<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+        assert(0 == M % F);
+        assert(0 == N % F);
+        assert(0 == K % F);
+        assert(0 == F % G);
+        assert((F*F) / (G*G) >= F);
+        // TODO: update your grid here
+        dim3 gridDim(ROUND_UP_TO_NEAREST(M, F), ROUND_UP_TO_NEAREST(N, F));
+        //dim3 gridDim(ROUND_UP_TO_NEAREST(M, 32)/F, ROUND_UP_TO_NEAREST(N, 32)/F);
+        dim3 blockDim((F*F)/(G*G));
+        runSharedMemMultiOutput<<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
         break;
     }
+    /*
     case tensor_hgemm:
     {
         assert(0 == M % F);
