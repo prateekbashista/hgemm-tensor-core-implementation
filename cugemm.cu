@@ -5,18 +5,21 @@
 #include <iomanip>
 #include <iostream>
 #include <random>
-
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <mma.h>
 
+using namespace std;
+using namespace nvcuda;
 // from https://github.com/jarro2783/cxxopts
 #include "cxxopts.hpp"
 
 #define cudaCheck(err) (cudaErrorCheck(err, __FILE__, __LINE__))
 #define cublasCheck(err) (cublasErrorCheck(err, __FILE__, __LINE__))
 #define ROUND_UP_TO_NEAREST(M, N) (((M) + (N)-1) / (N))
+
+//using namespace nvcuda;
 
 enum Algo
 {
@@ -33,9 +36,9 @@ const char *algo2str(Algo a)
     case cublas_hgemm:
         return "cublas_hgemm";
     /*case cuda_hgemm:
-        return "cuda_hgemm";
+        return "cuda_hgemm";*/
     case tensor_hgemm:
-        return "tensor_hgemm";*/
+        return "tensor_hgemm";
     default:
         return "INVALID";
     }
@@ -110,7 +113,7 @@ int main(int argc, char **argv)
     // GEMM computes C = α*AB+β*C
 
     // just do pure A*B (for simpler debugging)
-    half alpha = 1.0, beta = 1.0, initC = 1.0;
+    half alpha = 1.0, beta = 0.0, initC = 1.0;
 
     half *A = nullptr, *B = nullptr, *C = nullptr, *C_ref = nullptr;     // host matrices
     half *dA = nullptr, *dB = nullptr, *dC = nullptr, *dC_ref = nullptr; // device matrices
@@ -330,55 +333,51 @@ void runCublas(cublasHandle_t handle, int M, int N, int K, half alpha,
         C[(x * N) + y] = (alpha * tmp) + (beta * C[x * N + y]);
     }
 }
+*/
 
-__global__ void runGmemCoalesced(int M, int N, int K, float alpha, float *A, float *B, float beta, float *C)
+#define WMMA_M 16
+#define WMMA_N 16
+#define WMMA_K 16
+
+__global__ void tensor_impl(int M, int N, int K, half alpha, half *A, half *B, half beta, half *C)
 {
-    // HW1 TODO: copy runBasic() code here and update to avoid uncoalesced accesses to global memory.
-    // Note, you are also free to change the grid dimensions in the kernel launch below.
+    
 
-    uint16_t warp = 32;
+    int K_tiles = ROUND_UP_TO_NEAREST(K,WMMA_K);
 
-    const int x = blockIdx.x * warp + (threadIdx.x/warp);
-    const int y = blockIdx.y * warp + (threadIdx.x%warp);
+    int row  = blockIdx.y * WMMA_M;
+    int column  = blockIdx.x * WMMA_N;
 
-    // Each block contains 32 warps
-    //const int x_IDX = (x/32)+y;
-
-    // if (x < M && y < N)
-    // {   float A_temp = 0.0;
-    //     float B_temp = 0.0;
-    //     float tmp = 0.0;
-
-    //     // C = α*(AxB)+β*C
-    //     for (int i = 0; i < K; ++i)
-    //     {
-    //         // tmp += __A__[x][i] * __B__[i][y]
-    //         A_temp = A[(x * K) + i];
-    //         B_temp = B[(i * N) + y];
-    //         tmp += A_temp * B_temp;
-    //     }
-    //     // __C__[x][y]
-    //     float C_temp = C[x * N + y];
-    //     C[(x * N) + y] = (alpha * tmp) + (beta * C_temp);
-    // }
-
-    if (x < M && y < N)
+    if(row >= M && column >= N)
     {
-        float tmp = 0.0;
-        // C = α*(AxB)+β*C
-        for (int i = 0; i < K; ++i)
-        {
-            // tmp += __A__[x][i] * __B__[i][y]
-            tmp += A[(x * K) + i] * B[(i * N) + y];
-        }
-        // __C__[x][y]
-        C[(x * N) + y] = (alpha * tmp) + (beta * C[x * N + y]);
+        return;
     }
+
+    nvcuda::wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> C_frag;
+
+    nvcuda::wmma::fill_fragment(C_frag,0.0);
+
+#pragma unroll
+    for(int i = 0; i<K_tiles; ++i)
+    {
+        nvcuda::wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> A_frag;
+        nvcuda::wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> B_frag;
+
+        nvcuda::wmma::load_matrix_sync(A_frag, A + row*K + i*WMMA_K,K);
+        nvcuda::wmma::load_matrix_sync(B_frag, B + i*WMMA_K + column*K,K);
+
+        nvcuda::wmma::mma_sync(C_frag, A_frag, B_frag, C_frag);
+
+    }
+
+    wmma::store_matrix_sync(C + row * N + column, C_frag, N, wmma::mem_row_major);
+
+
 }
 
+/*
 
-
-__global__ void runSharedMem(int M, int N, int K, float alpha, float *A, float *B, float beta, float *C)
+__global__ void runSharedMem(int M, int N, int K, half alpha, half *A, half *B, half beta, half *C)
 {
     // HW2 TODO: Use shared memory to cache square FxF tiles of the A and B matrices in shared memory 
     // (SA and SB, respectively, provided below). Each thread should compute the result for one cell 
@@ -388,8 +387,8 @@ __global__ void runSharedMem(int M, int N, int K, float alpha, float *A, float *
     // of F (which is a constant, defined above). You should experiment with different values of F to see how it 
     // affects performance.
 
-    __shared__ float SA[F][F];
-    __shared__ float SB[F][F];
+    __shared__ half SA[F][F];
+    __shared__ half SB[F][F];
 
     const unsigned blkidx = blockIdx.x;
     const unsigned blkidy = blockIdx.y;
@@ -405,7 +404,7 @@ __global__ void runSharedMem(int M, int N, int K, float alpha, float *A, float *
     // const unsigned column = blkidx * F + threadx;
     if (row < M && column < N)
     {
-        float tmp = 0.0;
+        half tmp = 0.0;
         // C = α*(AxB)+β*C
         for (int i = 0; i < K/F; ++i)
         {
@@ -435,12 +434,12 @@ __global__ void runSharedMem(int M, int N, int K, float alpha, float *A, float *
         C[(row * K) + column] = (alpha * tmp) + (beta * C[row * K + column]);
     }
     }
-
 */
+/*
 const uint G = 4;
 const uint F = 32;
 
-__global__ void runSharedMemMultiOutput(int M, int N, int K, half alpha, half *A, half *B, half beta, half *C)
+__global__ void run_cuda_hgemm(int M, int N, int K, half alpha, half *A, half *B, half beta, half *C)
 {
     // HW3 TODO: Copy your runSharedMem() code here and update it so that each thread computes the result for GxG cells 
     // of the output matrix C. Each thread should accumulate temporary results in the local LC matrix, provided below,
@@ -452,7 +451,7 @@ __global__ void runSharedMemMultiOutput(int M, int N, int K, half alpha, half *A
     __shared__ half SA[F][F];
     __shared__ half SB[F][F];
 
-    half LC[G][G] = {0.0};
+    float LC[G][G] = {0.0};
     half resSA[G] = {0.0}; // Temp 
     half resSB[G] = {0.0}; // Temp
 
@@ -502,7 +501,7 @@ __global__ void runSharedMemMultiOutput(int M, int N, int K, half alpha, half *A
                 {
                     for(int n = 0 ; n < G ; ++n)
                     {
-                        LC[m][n] = LC[m][n] +  resSA[m] * resSB[n];
+                        LC[m][n] +=  __half2float(resSA[m]) * __half2float(resSB[n]);
 
                         //printf("\n LC  = %f \n", LC[m][n]);
                     }
@@ -519,12 +518,12 @@ __global__ void runSharedMemMultiOutput(int M, int N, int K, half alpha, half *A
         {
             for(int n = 0 ; n < G ; ++n)
             {
-                C[(row_l * G + m)*M + column_l * G + n] = (alpha * __float2half(LC[m][n])) + (beta * C[(row_l * G + m)*M + column_l * G + n]);
+                C[(row_l * G + m)*M + column_l * G + n] = (alpha * (LC[m][n])) + (beta * C[(row_l * G + m)*M + column_l * G + n]);
                 //printf("\n C at %d,%d  = %f , row  = %d, column = %d \n", (row_l * G + m)*M , column_l * G + n ,C[(row_l * G + m)*M + column_l * G + n], row_l, column_l);
             }
         }
         
-}
+}*/
 
 
 void runAlgo(Algo algo, cublasHandle_t handle, int M, int N, int K, half alpha,
@@ -535,35 +534,28 @@ void runAlgo(Algo algo, cublasHandle_t handle, int M, int N, int K, half alpha,
     case cublas_hgemm:
         runCublas(handle, M, N, K, alpha, A, B, beta, C);
         break;
-    case cuda_hgemm:
-    {
-        assert(0 == M % F);
-        assert(0 == N % F);
-        assert(0 == K % F);
-        assert(0 == F % G);
-        assert((F*F) / (G*G) >= F);
-        // TODO: update your grid here
-        dim3 gridDim(ROUND_UP_TO_NEAREST(M, F), ROUND_UP_TO_NEAREST(N, F));
-        //dim3 gridDim(ROUND_UP_TO_NEAREST(M, 32)/F, ROUND_UP_TO_NEAREST(N, 32)/F);
-        dim3 blockDim((F*F)/(G*G));
-        runSharedMemMultiOutput<<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+    // case cuda_hgemm:
+    // {
+    //     assert(0 == M % F);
+    //     assert(0 == N % F);
+    //     assert(0 == K % F);
+    //     assert(0 == F % G);
+    //     assert((F*F) / (G*G) >= F);
+    //     // TODO: update your grid here
+    //     dim3 gridDim(ROUND_UP_TO_NEAREST(M, F), ROUND_UP_TO_NEAREST(N, F));
+    //     //dim3 gridDim(ROUND_UP_TO_NEAREST(M, 32)/F, ROUND_UP_TO_NEAREST(N, 32)/F);
+    //     dim3 blockDim((F*F)/(G*G));
+    //     run_cuda_hgemm<<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+    //     break;
+    // }
+    case tensor_hgemm:
+    {   
+        dim3 block(32);
+        dim3 grid(ROUND_UP_TO_NEAREST(N, WMMA_N), ROUND_UP_TO_NEAREST(M,WMMA_M));
+
+        tensor_impl<<<grid, block>>>(M, N, K, alpha, A, B, beta, C);
         break;
     }
-    /*
-    case tensor_hgemm:
-    {
-        assert(0 == M % F);
-        assert(0 == N % F);
-        assert(0 == K % F);
-        assert(0 == F % G);
-        assert((F*F) / (G*G) >= F);
-        // TODO: update your grid here
-        dim3 gridDim(ROUND_UP_TO_NEAREST(M, F), ROUND_UP_TO_NEAREST(N, F));
-        //dim3 gridDim(ROUND_UP_TO_NEAREST(M, 32)/F, ROUND_UP_TO_NEAREST(N, 32)/F);
-        dim3 blockDim((F*F)/(G*G));
-        runSharedMemMultiOutput<<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
-        break;
-    }*/
     default:
         printf("Invalid algorithm: %d\n", algo);
         exit(EXIT_FAILURE);
