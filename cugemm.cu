@@ -35,8 +35,8 @@ const char *algo2str(Algo a)
     {
     case cublas_hgemm:
         return "cublas_hgemm";
-    /*case cuda_hgemm:
-        return "cuda_hgemm";*/
+    case cuda_hgemm:
+        return "cuda_hgemm";
     case tensor_hgemm:
         return "tensor_hgemm";
     default:
@@ -315,14 +315,14 @@ void runCublas(cublasHandle_t handle, int M, int N, int K, half alpha,
     cublasCheck(ok);
 }
 
-/*__global__ void runBasic(int M, int N, int K, float alpha, float *A, float *B, float beta, float *C)
+__global__ void run_cuda_hgemm(int M, int N, int K, half alpha, half *A, half *B, half beta, half *C)
 {
-    const unsigned x = blockIdx.x * blockDim.x + threadIdx.x;
-    const unsigned y = blockIdx.y * blockDim.y + threadIdx.y;
+    const unsigned y = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned x = blockIdx.y * blockDim.y + threadIdx.y;
 
     if (x < M && y < N)
     {
-        float tmp = 0.0;
+        half tmp = 0.0;
         // C = α*(AxB)+β*C
         for (int i = 0; i < K; ++i)
         {
@@ -333,7 +333,7 @@ void runCublas(cublasHandle_t handle, int M, int N, int K, half alpha,
         C[(x * N) + y] = (alpha * tmp) + (beta * C[x * N + y]);
     }
 }
-*/
+
 
 #define WMMA_M 16
 #define WMMA_N 16
@@ -451,7 +451,7 @@ __global__ void run_cuda_hgemm(int M, int N, int K, half alpha, half *A, half *B
     __shared__ half SA[F][F];
     __shared__ half SB[F][F];
 
-    float LC[G][G] = {0.0};
+    half LC[G][G] = {0.0};
     half resSA[G] = {0.0}; // Temp 
     half resSB[G] = {0.0}; // Temp
 
@@ -501,7 +501,7 @@ __global__ void run_cuda_hgemm(int M, int N, int K, half alpha, half *A, half *B
                 {
                     for(int n = 0 ; n < G ; ++n)
                     {
-                        LC[m][n] +=  __half2float(resSA[m]) * __half2float(resSB[n]);
+                        LC[m][n] +=  resSA[m] * resSB[n];
 
                         //printf("\n LC  = %f \n", LC[m][n]);
                     }
@@ -518,13 +518,13 @@ __global__ void run_cuda_hgemm(int M, int N, int K, half alpha, half *A, half *B
         {
             for(int n = 0 ; n < G ; ++n)
             {
-                C[(row_l * G + m)*M + column_l * G + n] = (alpha * (LC[m][n])) + (beta * C[(row_l * G + m)*M + column_l * G + n]);
+                C[(row_l * G + m)*M + column_l * G + n] = (alpha * (LC[m][n])) ;//+ (beta * C[(row_l * G + m)*M + column_l * G + n]);
                 //printf("\n C at %d,%d  = %f , row  = %d, column = %d \n", (row_l * G + m)*M , column_l * G + n ,C[(row_l * G + m)*M + column_l * G + n], row_l, column_l);
             }
         }
         
-}*/
-
+}
+*/
 
 void runAlgo(Algo algo, cublasHandle_t handle, int M, int N, int K, half alpha,
              half *A, half *B, half beta, half *C)
@@ -534,20 +534,13 @@ void runAlgo(Algo algo, cublasHandle_t handle, int M, int N, int K, half alpha,
     case cublas_hgemm:
         runCublas(handle, M, N, K, alpha, A, B, beta, C);
         break;
-    // case cuda_hgemm:
-    // {
-    //     assert(0 == M % F);
-    //     assert(0 == N % F);
-    //     assert(0 == K % F);
-    //     assert(0 == F % G);
-    //     assert((F*F) / (G*G) >= F);
-    //     // TODO: update your grid here
-    //     dim3 gridDim(ROUND_UP_TO_NEAREST(M, F), ROUND_UP_TO_NEAREST(N, F));
-    //     //dim3 gridDim(ROUND_UP_TO_NEAREST(M, 32)/F, ROUND_UP_TO_NEAREST(N, 32)/F);
-    //     dim3 blockDim((F*F)/(G*G));
-    //     run_cuda_hgemm<<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
-    //     break;
-    // }
+    case cuda_hgemm:
+    {
+        dim3 gridDim(ROUND_UP_TO_NEAREST(M, 32), ROUND_UP_TO_NEAREST(N, 32));
+        dim3 blockDim(32, 32);
+        run_cuda_hgemm<<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+        break;
+    }
     case tensor_hgemm:
     {   
         dim3 block(32);
