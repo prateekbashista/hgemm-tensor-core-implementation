@@ -24,8 +24,9 @@ using namespace nvcuda;
 enum Algo
 {
     cublas_hgemm = 0,
-    cuda_hgemm,
-    tensor_hgemm,
+    //cuda_hgemm,
+    tensor_hgemm  = 1,
+    tensor_alter = 2,
     numAlgos
 };
 
@@ -35,10 +36,12 @@ const char *algo2str(Algo a)
     {
     case cublas_hgemm:
         return "cublas_hgemm";
-    case cuda_hgemm:
-        return "cuda_hgemm";
+    // case cuda_hgemm:
+    //     return "cuda_hgemm";
     case tensor_hgemm:
         return "tensor_hgemm";
+    case tensor_alter:
+        return "tensor_alter";
     default:
         return "INVALID";
     }
@@ -315,24 +318,25 @@ void runCublas(cublasHandle_t handle, int M, int N, int K, half alpha,
     cublasCheck(ok);
 }
 
-__global__ void run_cuda_hgemm(int M, int N, int K, half alpha, half *A, half *B, half beta, half *C)
-{
-    const unsigned y = blockIdx.x * blockDim.x + threadIdx.x;
-    const unsigned x = blockIdx.y * blockDim.y + threadIdx.y;
+// __global__ void run_cuda_hgemm(int M, int N, int K, half alpha, half *A, half *B, half beta, float *C)
+// {
+//     const unsigned y = blockIdx.x * blockDim.x + threadIdx.x;
+//     const unsigned x = blockIdx.y * blockDim.y + threadIdx.y;
+    
 
-    if (x < M && y < N)
-    {
-        half tmp = 0.0;
-        // C = α*(AxB)+β*C
-        for (int i = 0; i < K; ++i)
-        {
-            // tmp += __A__[x][i] * __B__[i][y]
-            tmp += A[(x * K) + i] * B[(i * N) + y];
-        }
-        // __C__[x][y]
-        C[(x * N) + y] = (alpha * tmp) + (beta * C[x * N + y]);
-    }
-}
+//     if (x < M && y < N)
+//     {
+//         half tmp = 0.0;
+//         // C = α*(AxB)+β*C
+//         for (int i = 0; i < K; ++i)
+//         {
+//             // tmp += __A__[x][i] * __B__[i][y]
+//             tmp += A[(x * K) + i] * B[(i * N) + y];
+//         }
+//         // __C__[x][y]
+//         C[(x * N) + y] = (alpha * tmp) + (beta * C[x * N + y]);
+//     }
+// }
 
 
 #define WMMA_M 16
@@ -342,11 +346,10 @@ __global__ void run_cuda_hgemm(int M, int N, int K, half alpha, half *A, half *B
 __global__ void tensor_impl(int M, int N, int K, half alpha, half *A, half *B, half beta, half *C)
 {
     
-
     int K_tiles = ROUND_UP_TO_NEAREST(K,WMMA_K);
 
-    int row  = blockIdx.y * WMMA_M;
-    int column  = blockIdx.x * WMMA_N;
+    int row  = blockIdx.x * WMMA_M;
+    int column  = blockIdx.y * WMMA_N;
 
     if(row >= M && column >= N)
     {
@@ -354,14 +357,14 @@ __global__ void tensor_impl(int M, int N, int K, half alpha, half *A, half *B, h
     }
 
     nvcuda::wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> C_frag;
-
+    nvcuda::wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> A_frag;
+    nvcuda::wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> B_frag;
     nvcuda::wmma::fill_fragment(C_frag,0.0);
 
 #pragma unroll
     for(int i = 0; i<K_tiles; ++i)
     {
-        nvcuda::wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> A_frag;
-        nvcuda::wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> B_frag;
+
 
         nvcuda::wmma::load_matrix_sync(A_frag, A + row*K + i*WMMA_K,K);
         nvcuda::wmma::load_matrix_sync(B_frag, B + i*WMMA_K + column*K,K);
@@ -375,156 +378,65 @@ __global__ void tensor_impl(int M, int N, int K, half alpha, half *A, half *B, h
 
 }
 
-/*
-
-__global__ void runSharedMem(int M, int N, int K, half alpha, half *A, half *B, half beta, half *C)
-{
-    // HW2 TODO: Use shared memory to cache square FxF tiles of the A and B matrices in shared memory 
-    // (SA and SB, respectively, provided below). Each thread should compute the result for one cell 
-    // of the output matrix C.
-
-    // Note, you will also need to change the grid dimensions in the kernel launch below to take into account the value
-    // of F (which is a constant, defined above). You should experiment with different values of F to see how it 
-    // affects performance.
-
-    __shared__ half SA[F][F];
-    __shared__ half SB[F][F];
-
-    const unsigned blkidx = blockIdx.x;
-    const unsigned blkidy = blockIdx.y;
-    const unsigned bdimx = blockDim.x;
-    const unsigned bdimy = blockDim.x;
-    const unsigned threadx = threadIdx.x;
-    const unsigned thready = threadIdx.y;
-
-    const unsigned column = blockIdx.x * F + threadIdx.x;
-    const unsigned row = blockIdx.y * F + threadIdx.y;
-
-    // const unsigned row = blkidy * F + thready;
-    // const unsigned column = blkidx * F + threadx;
-    if (row < M && column < N)
-    {
-        half tmp = 0.0;
-        // C = α*(AxB)+β*C
-        for (int i = 0; i < K/F; ++i)
-        {
-            // tmp += __A__[x][i] * __B__[i][y]
-            //tmp += A[(x * K) + i] * B[(i * N) + y];
-            SA[thready][threadx] = A[(row * K) + i*F+threadx];
-
-            //Print debugs
-           //printf("A element at address %d = %f \n",(row * K) + i*F+threadx, A[(row * K) + i*F+threadx]);
-           //printf(" A Accessed into SA (address: %d,%d): %f , row  = %d , blockid = %d \n",thready,threadx,SA[thready][threadx],row,blockIdx.y);
-
-            //Print debugs
-            SB[thready][threadx] = B[(i* F + thready)*K + column];
-           //printf("B element at address %d  = %f \n",(i* F + thready)*K + column, B[(i* F + thready)*K + column]);
-           //printf(" B Accessed into SA (address: %d,%d): %f \n",thready,threadx,SB[thready][threadx]);
-
-           __syncthreads();
-
-            for(int j = 0; j < F; ++j)
-            {
-                tmp += SA[thready][j] * SB[j][threadx];
-
-            }
-                __syncthreads();
-        }
-        // __C__[x][y]
-        C[(row * K) + column] = (alpha * tmp) + (beta * C[row * K + column]);
-    }
-    }
-*/
-/*
-const uint G = 4;
 const uint F = 32;
 
-__global__ void run_cuda_hgemm(int M, int N, int K, half alpha, half *A, half *B, half beta, half *C)
+__global__ void tensor_impl_alter(int M, int N, int K, half alpha, half *A, half *B, half beta, half *C)
 {
-    // HW3 TODO: Copy your runSharedMem() code here and update it so that each thread computes the result for GxG cells 
-    // of the output matrix C. Each thread should accumulate temporary results in the local LC matrix, provided below,
-    // before writing them to C in global memory.
+    int row  = (blockIdx.x * blockDim.x  + threadIdx.x)/ warpSize;
+    int column = blockIdx.y * blockDim.y + threadIdx.y;
 
-    // Note, you will also need to change the grid dimensions in the kernel launch below. You should experiment 
-    // with different values of F and G to see how they affect performance.
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> A_frag; 
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> B_frag;
 
-    __shared__ half SA[F][F];
-    __shared__ half SB[F][F];
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> acc_frag;
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> C_frag;
 
-    half LC[G][G] = {0.0};
-    half resSA[G] = {0.0}; // Temp 
-    half resSB[G] = {0.0}; // Temp
+    wmma::fill_fragment(acc_frag, 0.0f);
 
-    //const unsigned threadx = threadIdx.x;
-    //const unsigned thready = threadIdx.y;
+    for(int i = 0; i<K; i = i + WMMA_K)
+    {
+        int row_idx_a = i;
+        int col_idx_a = row * WMMA_M;
+        int row_idx_b = column * WMMA_N;
+        int col_idx_b = i;
 
-   // const unsigned column = blockIdx.x * F + threadIdx.x;
-   // const unsigned row = blockIdx.y * F + threadIdx.y;
-
-    int divider = (F*F)/(G*G);
-    int stride  = divider / F;
-
-    const unsigned row_s = threadIdx.x / F;
-    const unsigned column_s = threadIdx.x % F;
-    const unsigned row_l = (threadIdx.x / (F/G));
-    const unsigned column_l = (threadIdx.x % (F/G)) ;
-
-    // Start of the Matrices
-    A += blockIdx.y * F * K;
-    B += blockIdx.x * F;
-    C += blockIdx.y * F * N + blockIdx.x * F;
-    
-
-
-        for (int i = 0; i < K/F; ++i)
+        if(row_idx_a < M && col_idx_a < K && row_idx_b < N && col_idx_b < K)
         {
-            // tmp += __A__[x][i] * __B__[i][y]
-            for(int c = 0; c < F; c+=stride)
-            {
-                SA[row_s + c][column_s] = A[((row_s + c) * K) + i*F+column_s];
-                SB[row_s + c][column_s] = B[(i* F + (row_s + c))*K + column_s];
-                
-            }
-            __syncthreads();    
+            half const* mat_ptr_a = A + row_idx_a + col_idx_a * M;
+            half const* mat_ptr_b = B + row_idx_b + col_idx_b * N;
 
-            for(int p = 0 ; p < F ; ++p)
-            {
-                for(int r = 0; r<G; ++r)
-                {
-                    resSA[r] = SA[row_l * G + r][p];
-                    resSB[r] = SB[p][column_l*G +r];
-                    //printf("row = %d, column = %d \n",row_l,column_l);
+            wmma::load_matrix_sync(A_frag, mat_ptr_a, M);
+            wmma::load_matrix_sync(B_frag, mat_ptr_b, N);
 
-                }
 
-                for(int m = 0 ; m < G ; ++m)
-                {
-                    for(int n = 0 ; n < G ; ++n)
-                    {
-                        LC[m][n] +=  resSA[m] * resSB[n];
+            wmma::mma_sync(acc_frag, A_frag, B_frag, acc_frag);
 
-                        //printf("\n LC  = %f \n", LC[m][n]);
-                    }
-                    
-                }
-                
-            }
-    
-            __syncthreads();
         }
-        // __C__[x][y]
+    }  
 
-        for(int m = 0 ; m < G ; ++m)
-        {
-            for(int n = 0 ; n < G ; ++n)
-            {
-                C[(row_l * G + m)*M + column_l * G + n] = (alpha * (LC[m][n])) ;//+ (beta * C[(row_l * G + m)*M + column_l * G + n]);
-                //printf("\n C at %d,%d  = %f , row  = %d, column = %d \n", (row_l * G + m)*M , column_l * G + n ,C[(row_l * G + m)*M + column_l * G + n], row_l, column_l);
-            }
-        }
-        
+    int c_row_idx  = row * WMMA_M;
+    int c_col_idx = column * WMMA_N;
+    wmma::store_matrix_sync(C + c_row_idx + c_col_idx * K, C_frag, N, wmma::mem_col_major);
+
+    // int c_row_idx  = row * WMMA_M;
+    // int c_col_idx = column * WMMA_N;
+
+    // if(c_row_idx < M && c_col_idx < N)
+    // {
+    //     half const* mat_ptr_c = C + c_row_idx + c_col_idx * K;
+
+    //     wmma::load_matrix_sync(C_frag, mat_ptr_c, K);//, wmma::mem_col_major);
+
+    //     for(int i = 0; i < C_frag.num_elements; i++)
+    //     {
+    //         C_frag.x[i] = alpha * acc_frag.x[i] + beta * C_frag.x[i];
+    //     }
+
+    //     wmma::store_matrix_sync(mat_ptr_c, C_frag, K);//,wmma::mem_col_major);
+    // }
 }
-*/
+
+
 
 void runAlgo(Algo algo, cublasHandle_t handle, int M, int N, int K, half alpha,
              half *A, half *B, half beta, half *C)
@@ -534,19 +446,33 @@ void runAlgo(Algo algo, cublasHandle_t handle, int M, int N, int K, half alpha,
     case cublas_hgemm:
         runCublas(handle, M, N, K, alpha, A, B, beta, C);
         break;
-    case cuda_hgemm:
+   /* case cuda_hgemm:
     {
         dim3 gridDim(ROUND_UP_TO_NEAREST(M, 32), ROUND_UP_TO_NEAREST(N, 32));
         dim3 blockDim(32, 32);
         run_cuda_hgemm<<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
         break;
-    }
+    }*/
     case tensor_hgemm:
     {   
         dim3 block(32);
         dim3 grid(ROUND_UP_TO_NEAREST(N, WMMA_N), ROUND_UP_TO_NEAREST(M,WMMA_M));
 
         tensor_impl<<<grid, block>>>(M, N, K, alpha, A, B, beta, C);
+        break;
+    }
+    case tensor_alter:
+    {
+        int warps_x = 4;
+        int warps_y = 4;
+
+        dim3 gridDim;
+        dim3 block(warps_x * 32, warps_y);
+
+        gridDim.x = (M + (WMMA_M * warps_x - 1)) / (WMMA_M * warps_x);
+        gridDim.y = (N + (WMMA_N * warps_y - 1)) / (WMMA_N * warps_y);
+
+        tensor_impl_alter<<<gridDim, block, 0>>>(M, N, K, alpha, A, B, beta, C);
         break;
     }
     default:
