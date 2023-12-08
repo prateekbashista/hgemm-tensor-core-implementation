@@ -10,7 +10,6 @@
 #include <cuda_fp16.h>
 #include <mma.h>
 
-using namespace std;
 using namespace nvcuda;
 // from https://github.com/jarro2783/cxxopts
 #include "cxxopts.hpp"
@@ -68,7 +67,7 @@ int main(int argc, char **argv)
     cxxopts::Options options("gemm.cu", "CUDA GEMM kernels");
     options.add_options()("size", "matrix size (N x N)", cxxopts::value<uint16_t>()->default_value("128"))                //
         ("reps", "repeat GEMM this many times", cxxopts::value<uint16_t>()->default_value("1"))                           //
-        ("algo", "GEMM algorithm to use, a number in [0,2], 0 is cuBLAS", cxxopts::value<uint16_t>()->default_value("0")) //
+        ("algo", "GEMM algorithm to use, a number in [0,2], 0 is cuBLAS", cxxopts::value<uint16_t>()->default_value("2")) //
         ("validate", "Validate output against cuBLAS", cxxopts::value<bool>()->default_value("true"))                     //
         ("rngseed", "PRNG seed", cxxopts::value<uint>()->default_value("2"))                     //
         ("h,help", "Print usage");
@@ -378,62 +377,71 @@ __global__ void tensor_impl(int M, int N, int K, half alpha, half *A, half *B, h
 
 }
 
-const uint F = 32;
-
-__global__ void tensor_impl_alter(int M, int N, int K, half alpha, half *A, half *B, half beta, half *C)
+//const uint G = 4;
+const uint F = 16;
+__global__ void tensor_sharedmem(int M, int N, int K, half alpha, half *A, half *B, half beta, half *C)
 {
-    int row  = (blockIdx.x * blockDim.x  + threadIdx.x)/ warpSize;
-    int column = blockIdx.y * blockDim.y + threadIdx.y;
+    const uint cRow = blockIdx.x;
+    const uint cCol = blockIdx.y;
 
-    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> A_frag; 
-    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> B_frag;
+    int row  = blockIdx.x * WMMA_M;
+    int column  = blockIdx.y * WMMA_N;
 
-    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> acc_frag;
-    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> C_frag;
+    __shared__ half SA[F*F];
+    __shared__ half SB[F*F];
 
-    wmma::fill_fragment(acc_frag, 0.0f);
+    const uint threadCol = threadIdx.x % F;
+    const uint threadRow = threadIdx.x / F;
 
-    for(int i = 0; i<K; i = i + WMMA_K)
-    {
-        int row_idx_a = i;
-        int col_idx_a = row * WMMA_M;
-        int row_idx_b = column * WMMA_N;
-        int col_idx_b = i;
+    A += cRow * F * K;                    // row=cRow, col=0
+    B += cCol * F;                        // row=0, col=cCol
+    C += cRow * F * N + cCol * F; // row=cRow, col=cCol
 
-        if(row_idx_a < M && col_idx_a < K && row_idx_b < N && col_idx_b < K)
-        {
-            half const* mat_ptr_a = A + row_idx_a + col_idx_a * M;
-            half const* mat_ptr_b = B + row_idx_b + col_idx_b * N;
-
-            wmma::load_matrix_sync(A_frag, mat_ptr_a, M);
-            wmma::load_matrix_sync(B_frag, mat_ptr_b, N);
-
-
-            wmma::mma_sync(acc_frag, A_frag, B_frag, acc_frag);
-
-        }
-    }  
-
-    int c_row_idx  = row * WMMA_M;
-    int c_col_idx = column * WMMA_N;
-    wmma::store_matrix_sync(C + c_row_idx + c_col_idx * K, C_frag, N, wmma::mem_col_major);
-
-    // int c_row_idx  = row * WMMA_M;
-    // int c_col_idx = column * WMMA_N;
-
-    // if(c_row_idx < M && c_col_idx < N)
+    // if(row >= M && column >= N)
     // {
-    //     half const* mat_ptr_c = C + c_row_idx + c_col_idx * K;
-
-    //     wmma::load_matrix_sync(C_frag, mat_ptr_c, K);//, wmma::mem_col_major);
-
-    //     for(int i = 0; i < C_frag.num_elements; i++)
-    //     {
-    //         C_frag.x[i] = alpha * acc_frag.x[i] + beta * C_frag.x[i];
-    //     }
-
-    //     wmma::store_matrix_sync(mat_ptr_c, C_frag, K);//,wmma::mem_col_major);
+    //     return;
     // }
+
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> C_frag;
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> A_frag;
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> B_frag;
+    wmma::fill_fragment(C_frag,0.0);
+
+    for(int i = 0; i<K; i+=F)
+    {   
+    //  As[threadRow * BLOCKSIZE + threadCol] = A[threadRow * K + threadCol];
+    //  Bs[threadRow * BLOCKSIZE + threadCol] = B[threadRow * N + threadCol];
+        SA[threadRow*F + threadCol] = A[threadRow*K + threadCol];
+        SB[threadRow*F + threadCol] = B[threadRow*N + threadCol];
+        __syncthreads();
+        A += F;
+        B += F * N;
+        // Loading the matrix
+
+        for(int j = 0; j < F; ++j)
+        {
+            for(int k = 0; k < F; ++k)
+            {   
+                half* SA_ptr = &SA[j*F + k];
+                half* SB_ptr = &SB[k*F + j];
+
+                // printf("\n SA_ptr = %f real_address = %f", __half2float(*SA_ptr),SA + j*F + k);
+                // printf("\n SB_ptr = %f", __half2float(*SB_ptr));
+                nvcuda::wmma::load_matrix_sync(A_frag,SA_ptr , F);
+                nvcuda::wmma::load_matrix_sync(B_frag,SB_ptr , F);
+            }
+        }
+            // Matrix Multiply and Add - Fuse Multiply And Add operation
+            nvcuda::wmma::mma_sync(C_frag, A_frag, B_frag, C_frag);
+        
+
+        //__syncthreads();
+
+    }
+
+    wmma::store_matrix_sync(C + threadRow * N + threadCol, C_frag, N, wmma::mem_row_major);
+
+
 }
 
 
@@ -463,16 +471,10 @@ void runAlgo(Algo algo, cublasHandle_t handle, int M, int N, int K, half alpha,
     }
     case tensor_alter:
     {
-        int warps_x = 4;
-        int warps_y = 4;
-
-        dim3 gridDim;
-        dim3 block(warps_x * 32, warps_y);
-
-        gridDim.x = (M + (WMMA_M * warps_x - 1)) / (WMMA_M * warps_x);
-        gridDim.y = (N + (WMMA_N * warps_y - 1)) / (WMMA_N * warps_y);
-
-        tensor_impl_alter<<<gridDim, block, 0>>>(M, N, K, alpha, A, B, beta, C);
+        dim3 gridDim(ROUND_UP_TO_NEAREST(M, F), ROUND_UP_TO_NEAREST(N, F));
+        //dim3 gridDim(ROUND_UP_TO_NEAREST(M, 32)/F, ROUND_UP_TO_NEAREST(N, 32)/F);
+        dim3 blockDim(F*F);
+        tensor_sharedmem<<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
         break;
     }
     default:
