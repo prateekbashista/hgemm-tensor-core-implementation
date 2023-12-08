@@ -417,29 +417,24 @@ __global__ void tensor_sharedmem(int M, int N, int K, half alpha, half *A, half 
         A += F;
         B += F * N;
         // Loading the matrix
-
+        half* SA_ptr = &SA[0];
+        half* SB_ptr = &SB[0];
         for(int j = 0; j < F; ++j)
         {
-            for(int k = 0; k < F; ++k)
-            {   
-                half* SA_ptr = &SA[j*F + k];
-                half* SB_ptr = &SB[k*F + j];
-
-                // printf("\n SA_ptr = %f real_address = %f", __half2float(*SA_ptr),SA + j*F + k);
-                // printf("\n SB_ptr = %f", __half2float(*SB_ptr));
-                nvcuda::wmma::load_matrix_sync(A_frag,SA_ptr , F);
-                nvcuda::wmma::load_matrix_sync(B_frag,SB_ptr , F);
-            }
+            //printf("\n SA_ptr = %d real_address = %d", SA_ptr,SA_ptr + threadRow*F +j*F);
+            //printf("\n SB_ptr = %d real_address = %d", SB_ptr, SB_ptr  + j*F + threadCol*F);
+            nvcuda::wmma::load_matrix_sync(A_frag,SA_ptr /*+ cRow*F +j*/, F);
+            nvcuda::wmma::load_matrix_sync(B_frag,SB_ptr/*  + j*F + threadCol*/, F);
         }
             // Matrix Multiply and Add - Fuse Multiply And Add operation
             nvcuda::wmma::mma_sync(C_frag, A_frag, B_frag, C_frag);
         
 
-        //__syncthreads();
+        __syncthreads();
 
     }
 
-    wmma::store_matrix_sync(C + threadRow * N + threadCol, C_frag, N, wmma::mem_row_major);
+    wmma::store_matrix_sync(C /*+ threadRow * N + threadCol*/, C_frag, N, wmma::mem_row_major);
 
 
 }
