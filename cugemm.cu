@@ -419,18 +419,18 @@ __global__ void tensor_sharedmem(int M, int N, int K, half alpha, half *A, half 
         // Loading the matrix
         half* SA_ptr = &SA[0];
         half* SB_ptr = &SB[0];
-        for(int j = 0; j < F; ++j)
-        {
+        // for(int j = 0; j < F; ++j)
+        // {
             //printf("\n SA_ptr = %d real_address = %d", SA_ptr,SA_ptr + threadRow*F +j*F);
             //printf("\n SB_ptr = %d real_address = %d", SB_ptr, SB_ptr  + j*F + threadCol*F);
             nvcuda::wmma::load_matrix_sync(A_frag,SA_ptr /*+ cRow*F +j*/, F);
             nvcuda::wmma::load_matrix_sync(B_frag,SB_ptr/*  + j*F + threadCol*/, F);
-        }
+        //}
             // Matrix Multiply and Add - Fuse Multiply And Add operation
             nvcuda::wmma::mma_sync(C_frag, A_frag, B_frag, C_frag);
         
 
-        __syncthreads();
+        //__syncthreads();
 
     }
 
