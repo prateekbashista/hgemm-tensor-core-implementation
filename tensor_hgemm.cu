@@ -24,6 +24,7 @@ enum Algo
 {
     cublas_hgemm = 0,
     tensor_hgemm,
+    tensor_16x16_shared_hgemm, // Shared Memory Algorithm Exploration
     numAlgos
 };
 
@@ -35,6 +36,8 @@ const char *algo2str(Algo a)
         return "cublas_hgemm";
     case tensor_hgemm:
         return "tensor_hgemm";
+    case tensor_16x16_shared_hgemm:
+        return "tensor_16x16_shared_hgemm";
     default:
         return "INVALID";
     }
@@ -361,6 +364,66 @@ __global__ void tensor_impl(int M, int N, int K, half alpha, half *A, half *B, h
 
 }
 
+//************************************** THIS IMPLEMENTATION RIGHT NOW ONLY WORKS WITH 16x16 MATRIX SIZE **************************************
+const uint F = 16;
+__global__ void tensor_sharedmem(int M, int N, int K, half alpha, half *A, half *B, half beta, half *C)
+{
+    const uint cRow = blockIdx.x;
+    const uint cCol = blockIdx.y;
+
+    int row  = blockIdx.x * WMMA_M;
+    int column  = blockIdx.y * WMMA_N;
+
+    __shared__ half SA[F*F];
+    __shared__ half SB[F*F];
+
+    const uint threadCol = threadIdx.x % F;
+    const uint threadRow = threadIdx.x / F;
+
+    A += cRow * F * K;                    // row=cRow, col=0
+    B += cCol * F;                        // row=0, col=cCol
+    C += cRow * F * N + cCol * F; // row=cRow, col=cCol
+
+
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> C_frag;
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> acc_frag;
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> A_frag;
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> B_frag;
+    wmma::fill_fragment(acc_frag,0.0);
+
+    for(int i = 0; i<K; i+=F)
+    {   
+
+        SA[threadRow*F + threadCol] = A[threadRow*K + threadCol];
+        SB[threadRow*F + threadCol] = B[threadRow*N + threadCol];
+        __syncthreads();
+        A += F;
+        B += F * N;
+        // Loading the matrix
+        half* SA_ptr = &SA[0]; // Starting point
+        half* SB_ptr = &SB[0];
+
+            nvcuda::wmma::load_matrix_sync(A_frag,SA_ptr, F);
+            nvcuda::wmma::load_matrix_sync(B_frag,SB_ptr, F);
+
+
+            nvcuda::wmma::mma_sync(acc_frag, A_frag, B_frag, acc_frag);
+        
+    }
+
+    wmma::load_matrix_sync(C_frag, C + row * N + column, K, wmma::mem_row_major);
+
+    for(int i = 0; i<C_frag.num_elements;i++)
+    {
+        C_frag.x[i] = alpha * acc_frag.x[i] + beta * C_frag.x[i];
+    }
+
+    wmma::store_matrix_sync(C , C_frag, N, wmma::mem_row_major);
+
+
+}
+
+
 void runAlgo(Algo algo, cublasHandle_t handle, int M, int N, int K, half alpha,
              half *A, half *B, half beta, half *C)
 {
@@ -376,6 +439,13 @@ void runAlgo(Algo algo, cublasHandle_t handle, int M, int N, int K, half alpha,
         dim3 grid(ROUND_UP_TO_NEAREST(N, WMMA_N), ROUND_UP_TO_NEAREST(M,WMMA_M));
 
         tensor_impl<<<grid, block>>>(M, N, K, alpha, A, B, beta, C);
+        break;
+    }
+    case tensor_16x16_shared_hgemm:
+    {
+        dim3 gridDim(ROUND_UP_TO_NEAREST(M, F), ROUND_UP_TO_NEAREST(N, F));
+        dim3 blockDim(F*F);
+        tensor_sharedmem<<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
         break;
     }
     default:
