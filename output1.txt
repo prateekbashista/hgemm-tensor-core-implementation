@@ -1,4 +1,0 @@
-Multiplying two 32 x 32 matrices with 1 trials using tensor_alter algorithm
-dimensions(m=n=k) 32, alpha: 1.000000, beta: 0.000000
-[CUDA ERROR] at file cugemm.cu:479:
-cudaErrorMisalignedAddress: misaligned address
